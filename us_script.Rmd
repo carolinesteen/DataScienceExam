@@ -1,0 +1,146 @@
+---
+title: "us covid"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Desktop/DataScience Exam/US_covid")
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(tsibbledata) # for accessing time series data from the book
+library(feasts)
+library(fpp3)
+library(fabletools)
+library(fable)
+library(distributional)
+
+
+install.packages("tis")
+library(tis)
+```
+# Importing the US covid data 
+```{r}
+us_covid19_daily <- read_csv("archive (1)/us_covid19_daily.csv")
+us_states <- read_csv("archive (1)/us_states_covid19_daily.csv", col_types = cols(date = col_double()))
+
+us_daily <- us_covid19_daily
+us_daily$date <- as.character(us_covid19_daily$date)
+us_states$date <- as.character(us_states$date)
+
+us_daily %>%
+  mutate(date = as_date(date, ymd(date))) %>%
+  as_tsibble(index = date)
+
+state_tsibble <- us_states %>% 
+  mutate(date = as_date(date, ymd(date))) %>%
+  as_tsibble(key = state, index = date)
+
+us_daily$positive <- as.numeric(us_daily$positive)
+
+```
+# importing and merging gdp and population data 
+```{r}
+gdp <- read_delim("~/Desktop/DataScience Exam/US_covid/gdp.csv", ";", escape_double = FALSE, trim_ws = TRUE)
+abriviations <- read_delim("~/Desktop/DataScience Exam/US_covid/abriviations.csv",";", escape_double = FALSE, trim_ws = TRUE)
+
+try <- merge(gdp, abriviations, by.x = "state_name", by.y = "state_name", all =TRUE)
+gdp_states <- subset(try, select = -state.x)
+
+
+gdp_states$gdp_capita <- as.character(gdp_states$gdp_capita)
+
+gdp_states$gdp_capita = gsub("\\$", "", gdp_states$gdp_capita)
+gdp_states$gdp_capita = gsub("\\,", ".", gdp_states$gdp_capita)
+
+gdp_states$gdp_capita <- as.numeric(gdp_states$gdp_capita)
+
+
+write_csv(try, "gdp_states_cleaned.csv")
+
+
+desity <- read_delim("~/Desktop/DataScience Exam/US_covid/desity.csv", ";", escape_double = FALSE, trim_ws = TRUE)
+population <- read_delim("~/Desktop/DataScience Exam/US_covid/population.csv", ";", escape_double = FALSE, col_types = cols(population = col_number()), trim_ws = TRUE)
+
+demographics <- merge(population, desity, by.x = "state_name", by.y = "state_name", all =TRUE)
+
+demographics <- merge(gdp_states, demographics, by.x = "state_name", by.y = "state_name", all =TRUE)
+
+demographics <- na.omit(demographics) 
+
+write_csv(demographics, "demographics_clean.csv")
+
+```
+
+# trying to merge demographics with dataset 
+```{r}
+full <- merge(state_tsibble, demographics, by.x = "state", by.y = "state.y", all =TRUE)
+
+fully <- full %>% 
+  mutate(date = as_date(date, ymd(date))) %>%
+  as_tsibble(key = state, index = date)
+
+fully$population_density <- as.numeric(fully$population_density)
+
+```
+
+
+
+```{r}
+ggplot(us_daily, aes(Date, positive)) +
+  geom_line()
+
+b <- us_states %>%
+  ggplot(aes(date, positive, color = state)) +
+  geom_line()
+b
+
+
+autoplot(us_tibble, positive)
+
+```
+```{r}
+
+
+sates <- fully %>%
+  group_by(state) %>%
+  summarise(positive = sum(positive/population))
+autoplot(sates, positive)+
+  labs(title = "COVID positive test / population")
+
+sates_dens <- fully %>%
+  group_by(state) %>%
+  summarise(positive = sum(positive/population_density))
+autoplot(sates_dens, positive)+
+  labs(title = "COVID positive test / population desity")
+
+```
+
+```{r}
+
+california <- state_tsibble %>%
+  filter(state == "CA")
+
+NY <- state_tsibble %>%
+  filter(state == "NY")
+
+lm <- lm(positive ~ date, california)
+summary(lm)
+
+lm2 <- lm(positive ~ date, NY)
+summary(lm2)
+
+growth.rate(california$positive, lag = 1, simple = T)
+
+
+
+
+
+```
+
