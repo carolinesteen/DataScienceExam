@@ -20,10 +20,15 @@ library(fpp3)
 library(fabletools)
 library(fable)
 library(distributional)
+library(lme4)
 
 
-install.packages("tis")
 library(tis)
+install.packages("prophet")
+library(prophet)
+
+install.packages("rstan")
+library(rstan)
 ```
 # Importing the US covid data 
 ```{r}
@@ -43,6 +48,7 @@ state_tsibble <- us_states %>%
   as_tsibble(key = state, index = date)
 
 us_daily$positive <- as.numeric(us_daily$positive)
+
 
 ```
 # importing and merging gdp and population data 
@@ -88,11 +94,15 @@ fully <- full %>%
 
 fully$population_density <- as.numeric(fully$population_density)
 
+write_csv(fully, "fully_merged_6may.csv")
+
 ```
 
 
 
 ```{r}
+
+
 ggplot(us_daily, aes(Date, positive)) +
   geom_line()
 
@@ -101,17 +111,51 @@ b <- us_states %>%
   geom_line()
 b
 
-
 autoplot(us_tibble, positive)
 
 ```
+
 ```{r}
+
+us_daily <- us_daily%>%
+  select(date, positive, )
+log_trans <- us_daily %>%
+  summarise(log = log(positive))
+
+log_trans$log <- 
+
+
+
+dcmp <- log_trans %>%
+  model(stl = STL(log))
+components(dcmp)
+
+components(dcmp) %>% autoplot()
+```
+
+```{r}
+components(dcmp) %>%
+  as_tsibble() %>%
+  autoplot(positive, colour = "gray") +
+  geom_line(aes(y=season_adjust), colour = "#0072B2") +
+  labs(y = "Persons (thousands)",
+       title = "Total employment in US retail")
+```
+
+
+
+```{r}
+
+states <- fully %>%
+  group_by(state) %>%
+autoplot(fully, positive)+
+  labs(title = "COVID positive test / population")
 
 
 sates <- fully %>%
   group_by(state) %>%
-  summarise(positive = sum(positive/population))
-autoplot(sates, positive)+
+  summarise(pos = sum(positive/population))
+autoplot(sates, pos)+
   labs(title = "COVID positive test / population")
 
 sates_dens <- fully %>%
@@ -123,6 +167,28 @@ autoplot(sates_dens, positive)+
 ```
 
 ```{r}
+death <- fully %>%
+  group_by(state) %>%
+  summarise(death_ = sum(death/population))
+autoplot(death, death_)+
+  labs(title = "COVID death / population")
+```
+
+
+```{r}
+pos-recovered <- fully %>%
+  group_by(state) %>%
+  summarise(death_ = sum(death/population))
+```
+
+```{r}
+
+sates$log <- log(sates$pos)
+
+lm <- lm(pos ~ date, data = sates)
+summary(lm)
+
+lm$coefficients[2]
 
 california <- state_tsibble %>%
   filter(state == "CA")
@@ -142,5 +208,78 @@ growth.rate(california$positive, lag = 1, simple = T)
 
 
 
+```
+```{r}
+us_all <- us_daily %>% 
+  select(date, positive)
+
+qplot(date, positive, data=us_all, main = "Total positive cases in the US")
+```
+```{r}
+ds <- us_all$date
+y <- us_all$positive
+
+df <- data.frame(ds, y)
+
+m <- prophet(df)
+
+future <- make_future_dataframe(m, period = 28)
+forecast <- predict(m, future)
+
+plot(m, forecast)
+dyplot.prophet(m, forecast)
+```
+```{r}
+#model performance 
+prophet_plot_components(m, forecast)
+pred <- forecast$yhat[1:320]
+actual <- m$history$y
+plot(actual, pred)
+summary(lm(pred~actual))
+
+```
+
+```{r}
+
+fully_df <- as.data.frame(fully)
+
+
+
+hello <- fully_df %>% 
+  group_by(state) %>%
+  select(state, date, positive, gdp, gdp_capita, population, population_density)
+
+hello <- na.omit(hello)
+
+
+hey <- hello %>% group_by(state) %>%
+  summarise(pos = max(positive))
+
+hi <- merge(demographics, hey, by.x="state.y", by.y="state")
+
+lm_full <- glm(pos ~ population + population_density + gdp_capita + gdp, data=hi)
+summary(lm_full)
+
+lm_gdp <- glm(pos ~ population_density + gdp_capita, data=hi)
+summary(lm_gdp)
+
+
+```
+
+
+```{r}
+fit <- t_df %>%
+  model(arima_person = ARIMA(Lix ~ Person),
+        arima_no = ARIMA(Lix))
+  
+fit %>% select(arima_person) %>% report()
+
+
+fit <- fully %>% 
+  group_by(state)%>%
+  model(arima_state = ARIMA(positive ~ gdp_capita),
+        arima_no = ARIMA(positive))
+
+fit %>% select(arima_state) %>% report()
 ```
 
