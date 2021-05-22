@@ -1,0 +1,327 @@
+---
+title: "Untitled"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Desktop/DataScience Exam/US_covid")
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(tsibbledata) 
+library(feasts)
+library(fpp3)
+library(fabletools)
+library(fable)
+library(distributional)
+library(lme4)
+library(tis)
+library(prophet)
+library(rstan)
+library(tseries)
+
+library(directlabels)
+```
+
+```{r}
+us_total <- read_csv("us_total21may.csv")
+ny_covid <- read_csv("ny_covid21may.csv")
+demographics_ny21may <- read_csv("demographics_ny21may.csv")
+
+us_total <- us_total %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date)
+
+ny_covid <- us_states %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key= state, index = date)
+
+autoplot(us_total, cases)
+autoplot(us_total, deaths)
+
+autoplot(ny_covid, cases)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1) 
+autoplot(ny_covid, deaths)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1) 
+
+```
+
+```{r}
+dcmp <- us_total %>%
+  model(stl = STL(cases))
+components(dcmp)
+components(dcmp) %>% autoplot()
+
+dcmp <- us_total %>%
+  model(stl = STL(deaths))
+components(dcmp)
+components(dcmp) %>% autoplot()
+```
+
+```{r}
+us_features_cases <- us_total %>%
+  features(cases, feature_set(pkgs = "feasts"))
+us_features_cases
+
+# trend_strength 0.9999993
+# seasonal_strength_week 0.4327512
+# seasonal_peak_week 4
+
+us_features_deaths <- us_total %>%
+  features(deaths, feature_set(pkgs = "feasts"))
+us_features_deaths
+# trend_strength 0.9999984
+# seasonal_strength_week 0.7981068
+# seasonal_peak_week 4
+```
+
+```{r}
+ETS_fit_cases <- us_total %>%
+  model(ETS(cases))
+report(ETS_fit_cases)
+
+components(ETS_fit_cases) %>%
+  autoplot() +
+  labs(title = "ETS(A,A,A) components")
+
+ETS_fit_deaths <- us_total %>%
+  model(ETS(deaths))
+report(ETS_fit_deaths)
+components(ETS_fit_deaths) %>%
+  autoplot() +
+  labs(title = "ETS(A,Ad,N) components")
+```
+
+```{r}
+train <- us_total[0:400,]
+test <- us_total[401:483,]
+test <- test %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date)
+
+train_fit <- train %>%
+  model(
+    `Simple Exponential method` = ETS(cases ~ error("A") + trend("N") + season("N")),
+    `Holt's method` = ETS(cases ~ error("A") + trend("A") + season("N")),
+    `Damped Holt's method` = ETS(cases ~ error("A") + trend("Ad") + season("N")))
+
+
+train_fc <- train_fit %>%
+  forecast(h = 83)
+
+train_fc %>%
+  autoplot(us_total, level = NULL) +
+  labs(
+    y = "Positive Cases",
+    title = "Positive COVID 19 Cases in the US"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))
+
+accuracy(train_fc, test)
+```
+```{r}
+train_fit_deaths <- train %>%
+  model(
+    `Holt's method` = ETS(deaths ~ error("A") + trend("A") + season("N")),
+    `Damped Holt's method` = ETS(deaths ~ error("A") + trend("Ad") + season("N")), 
+    `Simple Exponential method` = ETS(deaths ~ error("A") + trend("N") + season("N")))
+
+train_fc_deaths <- train_fit_deaths %>%
+  forecast(h = 83)
+
+train_fc_deaths %>%
+  autoplot(us_total, level = NULL) +
+  labs(
+    y = "Nr of deaths from COVID 19",
+    title = "Deaths from COVID 19 in the US"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))
+
+accuracy(train_fc_deaths, test)
+```
+
+```{r}
+fit_cases_diff <- train %>%
+  model(
+    additive = ETS(pos_diff ~ error("A") + trend("A") +
+                                                season("A")),
+    multiplicative = ETS(pos_diff ~ error("M") + trend("A") +
+                                                season("M")),
+    multiplicative_dampend = ETS(pos_diff ~ error("M") + trend("Ad") +
+                                                season("M")))
+fc_cases_diff <- fit_cases_diff  %>% forecast(h = 83)
+fc_cases_diff %>%
+  autoplot(us_total, level = NULL) +
+  labs(title="Positive Increase Covid Cases US",
+       y="Positive Cases") +
+  guides(colour = guide_legend(title = "Forecast"))
+accuracy(fc_cases_diff, test)
+```
+
+####--------Stationarity --------####
+```{r}
+#We use the KPSS test to determine the appropriate number of first differences for both variables 
+us_total %>%
+  features(cases, unitroot_ndiffs) # 2
+us_total %>%
+  features(deaths, unitroot_ndiffs) # 2
+#from the result we see that both varibales need two numbers of first differencing 
+
+
+# We use the unitroot_nsdiffs() to determine whether seasonal differencing is required
+us_total %>%
+  features(cases, unitroot_nsdiffs) # 0
+# for cases, no seasonal differencing is required 
+us_total %>%
+  features(deaths, unitroot_nsdiffs) # 1
+# for deaths, a seasonal differencing is reqired 
+
+# Because unitroot_nsdiffs() returns 1 for deaths (indicating one seasonal difference is required), we apply the unitroot_ndiffs() function to the seasonally differenced data to see whether we need a first differencing also 
+us_total %>%
+  mutate(seasonal_diff = difference((deaths), 7)) %>%
+  features(seasonal_diff, unitroot_ndiffs) # 1
+# returns 1, indicating that we should do a seasonal difference and a first difference.
+us_total %>%
+  mutate(seasonal_diff = difference((deaths), 7)) %>%
+  mutate(death_season_diff = difference(seasonal_diff))%>%
+  features(death_season_diff, unitroot_ndiffs) # 0
+# returns zero - so we should be able to use the differenced data to determine an appropriate arima model 
+
+```
+
+```{r}
+fitty <- us_total %>%
+  model(
+    arima012011 = ARIMA(cases ~ pdq(0,1,2) + PDQ(0,1,1)),
+    arima210011 = ARIMA(cases ~ pdq(2,1,0) + PDQ(0,1,1)),
+    auto = ARIMA(cases, stepwise = FALSE, approx = FALSE)
+  )
+fitty %>% pivot_longer(everything(), names_to = "Model name",
+                     values_to = "Orders")
+```
+
+
+
+```{r}
+
+us_total %>%
+  ACF(pos_diff_diff, lag_max = 50 ) %>%
+  autoplot()
+# we see that the ACF has a sinusoidal 
+us_total %>%
+  PACF(pos_diff_diff, lag_max = 50 ) %>%
+  autoplot()
+
+a <- us_total %>%
+  mutate(seasonal_diff = difference((deaths), 7)) %>%
+  mutate(death_season_diff = difference(seasonal_diff))
+
+us_total %>%
+  ACF(death_diff_diff, lag_max = 100 ) %>%
+  
+autoplot(us_total, death_diff_diff)
+
+autoplot(a, death_season_diff)
+
+autoplot(us_total, death_diff_diff)
+
+#Looking at our autocorrelation plots we can see that our data is not stationary and From our autocorrelation plots performed on the raw cases, differenced and double differenced we can see that in order to run an arima model we will have to double difference our variables. We do also see that our variables are not purly white noise after double differencing 
+```
+
+```{r}
+us_total %>%
+  gg_tsdisplay(difference(pos_diff, 7),
+               plot_type='partial', lag=50)
+us_total %>%
+  gg_tsdisplay(difference(pos_diff),
+               plot_type='partial', lag=50)
+
+us_total %>%
+  gg_tsdisplay(difference(death_diff, 7),
+               plot_type='partial', lag=50)
+
+us_total %>%
+  gg_tsdisplay(difference(death_diff),
+               plot_type='partial', lag=50)
+```
+
+```{r}
+caf_fit_cases <- train %>%
+  model(arima021 = ARIMA(cases ~ pdq(0,2,1) + PDQ(0,0,2)),
+        arima111 = ARIMA(cases ~ pdq(1,1,1) + PDQ(2,1,0)),
+        stepwise = ARIMA(cases),
+        search = ARIMA(cases, stepwise=FALSE))
+
+caf_fit_cases %>% pivot_longer(everything(), names_to = "Model name",
+                         values_to = "Orders")
+
+
+#<ARIMA(3,2,2)(1,0,0)[7]>
+
+glance(caf_fit_cases) %>% arrange(AICc) %>% select(.model:BIC)
+
+```
+
+
+```{r}
+fit <- train %>%
+  model(
+    ets = ETS(cases ~ trend("A")),
+    arima = ARIMA(cases)
+  )
+fit #ARIMA (0,2,1) (0,0,2)
+
+fit %>%
+  select(arima, ets) %>%
+  coef()
+
+fit %>%
+  glance()
+
+fit %>%
+  select(arima, ets) %>%
+  report()
+
+fit %>%
+  augment()
+
+fit %>%
+  accuracy() %>%
+  arrange(MASE)
+
+fc <- fit %>%
+  forecast(h = 100)
+fc
+
+fc %>%
+  autoplot(us_total)
+```
+
+
+###------- SUBSETS OF State of Interest (SOI) ---------####
+```{r}
+
+SOI_ny <- subset(ny_covid, state=="NY" | state=="VT" | state=="ND" | state=="LA" | state=="MA" | state=="CA" | state=="FL" | state=="CT")
+
+SOI_ny <- SOI_ny %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key=state, index = date)
+
+dcmp_SOI <- SOI_ny %>%
+  model(stl = STL(pos_pop))
+components(dcmp_SOI)
+components(dcmp_SOI) %>% autoplot()
+
+autoplot(SOI_ny, pos_pop)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1) 
+
+autoplot(SOI_ny, death_pop)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1) 
+
+autoplot(SOI_ny, deaths_pos_pop)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1) 
