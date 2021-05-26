@@ -1,0 +1,799 @@
+---
+title: "DS_EXAM_COVID_CODE"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Desktop/DataScience Exam/US_covid")
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(tsibbledata) 
+library(feasts)
+library(fpp3)
+library(fabletools)
+library(fable)
+library(distributional)
+library(lme4)
+library(tis)
+library(prophet)
+library(rstan)
+library(tseries)
+library(directlabels)
+```
+
+
+```{r}
+# loading in COVID data for all of US
+us_total <- read_csv("us_total21may.csv")
+demographics_ny21may <- read_csv("demographics_ny21may.csv")
+ny_covid <- read_csv("ny_covid21may.csv")
+restrictions <- read_csv("restrictions.csv")
+
+us_total <- us_total %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date)
+
+# transforming variables 
+us_total <- us_total %>% 
+  mutate(pos_log = log(cases)) %>%
+  mutate(death_log = log(deaths)) %>%
+  mutate(pos_diff = difference(cases)) %>%
+  mutate(death_diff = difference(deaths))%>%
+  mutate(death_diff_diff = difference(death_diff))%>%
+  mutate(pos_diff_diff = difference(pos_diff))
+
+us_total <- us_total %>%
+  mutate(death_season = difference(death_diff, 7))%>%
+  mutate(death_season_diff = difference(death_season))
+
+# calculating lambda for cases 
+lambda_cases <- us_total %>%
+  features(cases, features = guerrero) %>%
+  pull(lambda_guerrero)
+# mutating box-cox transformed values for cases 
+us_total <- us_total %>%
+  mutate(box_cox_cases = box_cox(cases, lambda_cases))
+
+# calculating lambda for deaths
+lambda_deaths <- us_total %>%
+  features(deaths, features = guerrero) %>%
+  pull(lambda_guerrero)
+# mutating box-cox transformed values for deaths 
+us_total <- us_total %>%
+  mutate(box_cox_deaths = box_cox(deaths, lambda_deaths))
+
+# loading in the data with individual states
+ny_covid <- read_csv("ny_covid21may.csv")
+ny_covid <- ny_covid %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key= state, index = date)
+
+# loading in the data with restrictions
+restrictions <- read_csv("restrictions.csv")
+restrictions <- restrictions %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date)
+```
+
+#autoplotting different variables of interest
+```{r}
+#autoplotting different variables of interest
+autoplot(us_total, cases)+
+  theme_classic()+
+  scale_x_date(breaks = date_breaks("months"),labels = date_format("%b"))
+autoplot(us_total, deaths)+
+  theme_classic()
+autoplot(us_total, pos_diff)+
+    theme_classic()+
+  scale_x_date(breaks = date_breaks("months"),labels = date_format("%b"))# cases increase per day 
+autoplot(us_total, death_diff)+
+    theme_classic()+
+  scale_x_date(breaks = date_breaks("months"),labels = date_format("%b"))
+
+# inspecting other transformed variables 
+autoplot(us_total, death_diff) # deaths increase per day 
+autoplot(us_total, pos_diff_diff) # doubles differenced cases
+autoplot(us_total, death_diff_diff) # doubles differenced deaths
+autoplot(us_total, pos_log)
+autoplot(us_total, box_cox_cases)
+autoplot(us_total, box_cox_deaths)
+autoplot(us_total, difference(box_cox_cases))
+autoplot(us_total, difference(box_cox_deaths))
+
+#plotting for each state
+autoplot(ny_covid, pos_pop)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.5)+
+  labs(title = "Normalised Positive cases - US state")+
+  ylab("Positive cases")+
+  theme_minimal()
+autoplot(ny_covid, death_pop)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.5)+
+  labs(title = "Normalised deaths - US state")+
+  ylab("Deaths")+
+  theme_minimal()
+```
+
+
+#autocorrelation plts for cases and deaths 
+```{r}
+us_total %>%
+  ACF(cases, lag_max = 100)%>%
+  autoplot()
+us_total %>%
+  PACF(cases, lag_max = 100)%>%
+  autoplot()
+us_total %>%
+  ACF(deaths, lag_max = 100)%>%
+  autoplot()
+us_total %>%
+  PACF(deaths, max_lag = 100)%>%
+  autoplot()
+```
+
+
+# STL decomposition and features of cases and deaths for all of US
+```{r}
+# stl decomposition for cases 
+dcmp_cases <- us_total %>%
+  model(stl = STL(cases))
+components(dcmp_cases) %>% autoplot() +
+  labs(title = "STL decomposition of positive cases")+
+  theme_minimal()
+
+# stl decomposition for deaths
+dcmp_deaths <- us_total %>%
+  model(stl = STL(deaths))
+components(dcmp_deaths)
+components(dcmp_deaths) %>% autoplot()+
+  labs(title = "STL decomposition of deaths")+
+  theme_minimal()
+
+# cases stl features - trend/seasonal strength 
+us_total %>%
+  features(cases, feat_stl)
+# deaths stl features - trend/seasonal strength 
+us_total %>%
+  features(deaths, feat_stl)
+```
+
+
+# Splitting US total into train/test split 
+```{r}
+# Train / test split - approx 80/20 
+train <- us_total[0:387,]
+test <- us_total[388:483,]
+
+#Making test and train set into stibbles 
+train <- train %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date)
+
+test <- test %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date)
+```
+
+# Manually Searching and evaluating ETS models for cases
+```{r}
+train_fit_cases <- train %>%
+  model(
+    `Holt's method` = ETS(cases ~ error("A") + trend("A") + season("N")),
+    `Additive Holt-Winter's method` = ETS(cases ~ error("A") + trend("A") + season("A")),
+    `Damped Holt's method` = ETS(cases ~ error("A") + trend("Ad") + season("N")),
+    `Additive Damped Holt-Winter's method` = ETS(cases ~ error("A") + trend("Ad") + season("A")), 
+    `Simple Exponential method` = ETS(cases ~ error("A") + trend("N") + season("N"))
+    )
+train_fit_cases %>%
+  report()
+glance(train_fit_cases) %>% arrange(AIC) %>% select(.model:BIC)
+train_fit_cases %>%
+  accuracy() %>%
+  arrange(MAPE)
+train_fc_cases <- train_fit_cases %>%
+  forecast(h = 96)
+train_fc_cases %>%
+  autoplot(us_total, level = NULL) +
+  labs(
+    y = "Positive Cases",
+    title = "Positive COVID 19 Cases in the US"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))+
+  theme_minimal()
+accuracy(train_fc_cases, test)%>%
+  arrange(RMSE)
+train_fit_cases %>%
+  select(`Additive Holt-Winter's method`) %>%
+  gg_tsresiduals()
+```
+
+# Manually searching for and evaluating best ETS model deaths
+```{r}
+train_fit_deaths <- train %>%
+  model(
+    `Holt's method` = ETS(deaths ~ error("A") + trend("A") + season("N")),
+    `Additive Holt-Winter's method` = ETS(deaths ~ error("A") + trend("A") + season("A")),
+    `Damped Holt's method` = ETS(deaths ~ error("A") + trend("Ad") + season("N")), 
+    `Additive Damped Holt-Winter's method` = ETS(deaths ~ error("A") + trend("Ad") + season("A")), 
+    `Simple Exponential method` = ETS(deaths ~ error("A") + trend("N") + season("N")))
+
+train_fit_deaths %>%
+  report()
+train_fit_deaths %>%
+  accuracy() %>%
+  arrange(MAPE)
+glance(train_fit_deaths) %>% arrange(AIC) %>% select(.model:BIC)
+
+train_fc_deaths <- train_fit_deaths %>%
+  forecast(h = 96)
+
+train_fc_deaths %>%
+  autoplot(us_total, level = NULL) +
+  labs(
+    y = "Nr of deaths from COVID 19",
+    title = "Deaths from COVID 19 in the US"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))+
+  theme_minimal()
+
+accuracy(train_fc_deaths, test)%>%
+  arrange(MAPE)
+
+train_fit_deaths %>%
+  select(`Additive Damped Holt-Winter's method`) %>%
+  gg_tsresiduals()
+```
+
+
+# Manual/AUtomatic Search for best arima models for cases
+```{r}
+caf_fit_cases <- train %>%
+  model(arima021 = ARIMA(cases ~ pdq(0,2,1) + PDQ(0,0,2)),
+        arima111 = ARIMA(cases ~ pdq(1,1,1) + PDQ(2,1,0)),
+        arima322 = ARIMA(cases ~ pdq(3,2,2) + PDQ(0,0,1)),
+        stepwise = ARIMA(cases),
+        search = ARIMA(cases, stepwise=FALSE, greedy=FALSE, approximation = FALSE))
+
+caf_fit_cases %>% pivot_longer(everything(), names_to = "Model name",
+                         values_to = "Orders")
+glance(caf_fit_cases) %>% arrange(AICc) %>% select(.model:BIC)
+caf_fit_cases %>%
+  select(arima111) %>%
+  gg_tsresiduals()
+caf_fit_cases %>%
+  augment()
+caf_fit_cases %>%
+  accuracy() %>%
+  arrange(MASE)
+fc_cases_arima <- caf_fit_cases %>%
+  forecast(h = 96)
+fc_cases_arima %>%
+  autoplot(us_total)+
+  theme_minimal()
+fc_cases_arima %>% 
+  accuracy(test)
+fc_cases_arima %>%
+  autoplot(us_total, level = NULL) +
+  guides(colour = guide_legend(title = "Forecast"))+
+  labs(y = "Positive Cases",title = "Arima Forecast of positive cases") +
+  theme_minimal()
+```
+# Manual/automatic Search for best arima models for death
+```{r}
+caf_fit_deaths <- train %>%
+  model(arima021 = ARIMA(deaths ~ pdq(0,2,1) + PDQ(0,0,2)),
+        arima112 = ARIMA(deaths ~ pdq(1,1,2) + PDQ(0,1,1)),
+        arima211 = ARIMA(deaths ~ pdq(2,1,1) + PDQ(1,1,2)),
+        arima312 = ARIMA(deaths ~ pdq(3,1,2) + PDQ(0,1,1)),
+        arima111 = ARIMA(deaths ~ pdq(1,1,1) + PDQ(2,1,0)),
+        stepwise = ARIMA(deaths),
+        search = ARIMA(deaths, stepwise=FALSE, approximation = FALSE))
+
+caf_fit_deaths %>% pivot_longer(everything(), names_to = "Model name",
+                         values_to = "Orders")
+
+glance(caf_fit_deaths) %>% arrange(AICc) %>% select(.model:BIC)
+
+fc_deaths_arima <- caf_fit_deaths %>%
+  forecast(h = 96)
+fc_deaths_arima %>%
+  autoplot(us_total)+
+  theme_minimal()
+fc_deaths_arima %>% 
+  accuracy(test)
+fc_deaths_arima %>%
+  autoplot(us_total, level = NULL) +
+  guides(colour = guide_legend(title = "Forecast"))+
+    labs(y = "Deaths",title = "Arima Forecast of Deaths") +
+  theme_minimal()
+
+caf_fit_deaths %>%
+  select(search) %>%
+  gg_tsresiduals()
+```
+
+# testing Manually selected best Arima and ETS models on cases
+```{r}
+fit <- train %>%
+  model(
+    arima111 = ARIMA(cases ~ pdq(1,1,1) + PDQ(2,1,0)),
+    `Additive Holt-Winter's method` = ETS(cases ~ error("A") + trend("A") + season("A")))
+fit
+fit %>%
+  select(arima111, `Additive Holt-Winter's method`) %>%
+  coef()
+
+fit %>%
+  glance()
+fit %>%
+  select(arima111,`Additive Holt-Winter's method`) %>%
+  report()
+fit %>%
+  augment()
+
+fit %>%
+  accuracy() %>%
+  arrange(MASE)
+fc <- fit %>%
+  forecast(h = 96)
+fc %>%
+  autoplot(us_total)+
+  theme_minimal()+
+  labs(y = "Positive Cases",title = "Comparing Arima and ETS Forecast of cases") 
+fc %>% 
+  accuracy(test)%>% arrange(RMSE)
+
+#for cases it seems that the arima model does best on the training data, however, the ets model does better on forecasting the test data 
+# Mean absolute percentage error: MAPE
+#ets: 0.47
+#arima: 2.59
+
+fit %>%
+  select(`Additive Holt-Winter's method`) %>%
+  gg_tsresiduals()+
+  labs(title = "`Additive Holt-Winter's method` residuals for cases") 
+
+fit %>%
+  select(arima111) %>%
+  gg_tsresiduals()+
+  labs(title = "Arima(1,1,1)(2,1,0)` residuals for cases")  
+
+augment(fit) %>%
+  features(.resid, ljung_box, lag = 7, dof = 0)
+```
+
+
+
+# camparing manually selected best Arima and ETS models on deaths
+```{r}
+fit <- train %>%
+  model(
+    `Additive Holt-Winter's method` = ETS(deaths ~ error("A") + trend("A") + season("A")),  
+    arima312 = ARIMA(deaths ~ pdq(3,1,2) + PDQ(0,1,1)))
+fit %>%
+  select(arima312,`Additive Holt-Winter's method`) %>%
+  coef()
+fit %>%
+  glance()
+fit %>%
+  select(arima312,`Additive Holt-Winter's method`) %>%
+  report()
+fit %>%
+  augment()
+fit %>%
+  accuracy() %>%
+  arrange(RMSE)
+fc <- fit %>%
+  forecast(h = 96)
+fc %>%
+  autoplot(us_total)+
+  theme_minimal()+
+  labs(y = "Deaths",title = "Comparing Arima and ETS Forecast of deaths") 
+fc %>%
+  accuracy(test)%>%
+  arrange(RMSE)
+
+# for deaths it also seems that the ets model performs best on the test data 
+# MAPE: ets 2.24
+# MAPE: arima 4.79
+
+fit %>%
+  select(`Additive Holt-Winter's method`) %>%
+  gg_tsresiduals()+
+  labs(title = "`Additive Holt-Winter's method` residuals for deaths") 
+
+fit %>%
+  select(arima312) %>%
+  gg_tsresiduals()+
+  labs(title = "`Arima(3,1,2)(0,1,1)` residuals for deaths") 
+
+augment(fit) %>%
+  features(.resid, ljung_box, lag = 7, dof = 0)
+```
+
+
+# Camparing forecasting with automatically chosen best Arima and ETS models on cases
+```{r}
+fit_cases <- train %>%
+  model(
+    ets = ETS(cases),
+    arima = ARIMA(cases, stepwise=FALSE, approximation = FALSE))
+fit_cases %>%
+  select(arima, ets) %>%
+  coef()
+fit_cases %>%
+  glance()
+fit_cases %>%
+  select(arima, ets) %>%
+  report()
+fit_cases %>%
+  augment()
+fit_cases %>%
+  accuracy() %>%
+  arrange(MASE)
+fc_cases <- fit_cases %>%
+  forecast(h = 96)
+fc_cases %>%
+  autoplot(us_total)
+fc_cases %>% 
+  accuracy(test)
+
+fit_cases %>%
+  select(ets) %>%
+  gg_tsresiduals()
+
+fit_cases %>%
+  select(arima) %>%
+  gg_tsresiduals()
+```
+
+```{r}
+fit_deaths <- train %>%
+  model(
+    ets = ETS(deaths),
+    arima = ARIMA(deaths, stepwise=FALSE, approximation = FALSE))
+fit_deaths %>%
+  select(arima, ets) %>%
+  coef()
+fit_deaths %>%
+  glance()
+fit_deaths %>%
+  select(arima, ets) %>%
+  report()
+fit_deaths %>%
+  augment()
+fit_deaths %>%
+  accuracy() %>%
+  arrange(MASE)
+fc_deaths <- fit_deaths %>%
+  forecast(h = 96)
+fc_deaths %>%
+  autoplot(us_total)
+fc_deaths %>% 
+  accuracy(test)
+
+fit_deaths %>%
+  select(ets) %>%
+  gg_tsresiduals()
+
+fit_deaths %>%
+  select(arima) %>%
+  gg_tsresiduals()
+```
+
+
+
+
+
+###------- SUBSETS OF State of Interest (SOI) ---------####
+```{r}
+STATES_OI <- subset(ny_covid, state=="NY" | state=="VT" | state=="ND")
+# removing dates that are not shared by all three series 
+NY <- subset(ny_covid, state=="NY")
+NY <- subset(NY, date >= "2020-03-11")
+ND <- subset(ny_covid, state=="ND")
+ND <- subset(ND, date >= "2020-03-11")
+VT <- subset(ny_covid, state=="VT")
+VT <- subset(VT, date >= "2020-03-11")
+
+STATES_OI <- rbind(NY, ND, VT)
+STATES_OI <- STATES_OI %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key=state, index = date)
+
+#changing the cases variables to the variables normalised by population for better comparison 
+STATES_OI$cases_raw <- STATES_OI$cases
+STATES_OI$cases <- STATES_OI$pos_pop
+STATES_OI$deaths_raw <- STATES_OI$deaths
+STATES_OI$deaths <- STATES_OI$death_pop
+
+STATES_OI <- STATES_OI %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key=state, index = date)
+
+# Plotting the positive cases  and death trajectories 
+autoplot(STATES_OI, cases)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1)+
+  theme_minimal()+
+  labs(title = "Positive Cases per State")+
+  ylab("Cases/Population Size")
+autoplot(STATES_OI, deaths)+
+  geom_dl(aes(label = state), method = list(dl.combine("last.points")), cex = 0.1)+
+  theme_minimal()+
+  labs(title = "Deaths per State")+
+  ylab("Deaths/Population Size")
+```
+# STL and features for each state 
+```{r}
+# STL decomposition of the cases per state 
+dcmp_SOI <- STATES_OI %>%
+  model(stl = STL(cases))
+components(dcmp_SOI)%>%
+  features()
+components(dcmp_SOI) %>% autoplot()+
+  theme_minimal()
+# STL decomposition of the deaths per state 
+dcmp_SOI <- STATES_OI %>%
+  model(stl = STL(deaths))
+components(dcmp_SOI)
+components(dcmp_SOI) %>% autoplot()+
+  theme_minimal()
+
+STATES_OI %>%
+  features(cases, feat_stl)
+
+STATES_OI %>%
+  features(deaths, feat_stl)
+```
+
+
+# Train/Test split of states of interest 
+```{r}
+train_SOI <- STATES_OI %>%
+  group_by(state) %>%
+  slice(1:348)
+
+test_SOI <- STATES_OI %>%
+  group_by(state) %>%
+  slice(349:435)
+
+train_SOI <- train_SOI %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key=state, index = date)
+
+test_SOI <- test_SOI %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(key=state, index = date)
+```
+
+# evaluating best ETS model for each state
+```{r}
+train_SOI_fit <- train_SOI %>%
+  model(
+    `Simple Exponential method` = ETS(cases ~ error("A") + trend("N") + season("N")),
+    `Holt's method` = ETS(cases ~ error("A") + trend("A") + season("N")),
+    `Additive Holt-Winter's method` = ETS(cases ~ error("A") + trend("A") + season("A")),
+    `Damped Holt's method` = ETS(cases ~ error("A") + trend("Ad") + season("N")),
+    `Additive Damped Holt-Winter's method` = ETS(cases ~ error("A") + trend("Ad") + season("A"))
+    )
+
+glance(train_SOI_fit) %>% arrange(AIC) %>% select(.model:BIC)
+train_SOI_fit %>%
+  accuracy() %>%
+  arrange(RMSE)
+
+train_SOI_fc <- train_SOI_fit %>%
+  forecast(h = 86)
+
+train_SOI_fc %>%
+  autoplot(STATES_OI, level = NULL) +
+  labs(
+    y = "Positive Cases",
+    title = "Positive COVID 19 Cases per state"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))+
+  theme_minimal()
+
+accuracy(train_SOI_fc, test_SOI) %>% arrange(MAPE)
+```
+# fitting and chosing the best ets model for deaths for each state 
+```{r}
+train_SOI_fit_deaths <- train_SOI %>%
+  model(
+    `Simple Exponential method` = ETS(deaths ~ error("A") + trend("N") + season("N")),
+    `Holt's method` = ETS(deaths ~ error("A") + trend("A") + season("N")),
+    `Additive Holt-Winter's method` = ETS(deaths ~ error("A") + trend("A") + season("A")),
+    `Damped Holt's method` = ETS(deaths ~ error("A") + trend("Ad") + season("N")),
+    `Additive Damped Holt-Winter's method` = ETS(deaths ~ error("A") + trend("Ad") + season("A"))
+    )
+
+glance(train_SOI_fit_deaths) %>% arrange(AIC) %>% select(.model:BIC)
+train_SOI_fit_deaths %>%
+  accuracy() %>%
+  arrange(RMSE)
+
+train_SOI_fc_deaths <- train_SOI_fit_deaths %>%
+  forecast(h = 86)
+
+train_SOI_fc_deaths %>%
+  autoplot(STATES_OI, level = NULL) +
+  labs(
+    y = "Deaths/Population size",
+    title = "COVID 19 Deaths per state forecast"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))+
+  theme_minimal()
+
+test_scores <- accuracy(train_SOI_fc_deaths, test_SOI) %>% arrange(MAPE)
+```
+# automatically fitting and chosing the best ets and arima model for cases for each state 
+```{r}
+fit_ARIMA_states_cases <- train_SOI %>%
+  model(
+    ets = ETS(cases),
+    arima = ARIMA(cases, stepwise = FALSE, approximation = FALSE))
+
+fit_ARIMA_states_cases
+
+fit_ARIMA_states_cases %>%
+  select(arima, ets) %>%
+  coef()
+
+fit_ARIMA_states_cases %>%
+  glance()
+fit_ARIMA_states_cases %>%
+  select(arima, ets) %>%
+  report()
+fit_ARIMA_states_cases %>%
+  augment()
+augment
+fit_ARIMA_states_cases %>%
+  accuracy() %>%
+  arrange(MASE)
+fc_ARIMA_states_cases <- fit_ARIMA_states_cases %>%
+  forecast(h = 86)
+fc_ARIMA_states_cases %>%
+  autoplot(STATES_OI)+
+  theme_minimal()+
+  labs(y = "Cases",title = "Comparing Arima and ETS Forecast of cases per each state") 
+
+test_scores <- fc_ARIMA_states_cases %>% 
+  accuracy(test_SOI)%>%
+  arrange(MAPE)
+```
+
+
+# automatically fitting and chosing the best ets and arima model for deaths for each state 
+```{r}
+
+fit_ARIMA_states_deaths <- train_SOI %>%
+  model(
+    ets = ETS(deaths),
+    arima = ARIMA(deaths, stepwise = FALSE, approximation = FALSE))
+fit_ARIMA_states_cases
+
+fit_ARIMA_states_deaths %>%
+  select(arima, ets) %>%
+  coef()
+
+fit_ARIMA_states_deaths %>%
+  glance()
+fit_ARIMA_states_deaths %>%
+  select(arima, ets) %>%
+  report()
+fit_ARIMA_states_deaths %>%
+  augment()
+fit_ARIMA_states_deaths %>%
+  accuracy() %>%
+  arrange(MASE)
+fc_ARIMA_states_deaths <- fit_ARIMA_states_deaths %>%
+  forecast(h = 86)
+fc_ARIMA_states_deaths %>%
+  autoplot(STATES_OI)+
+  theme_minimal()+
+  labs(y = "Deaths",title = "Comparing Arima and ETS Forecast of deaths per each state") 
+
+test_scores2 <- fc_ARIMA_states_deaths %>% 
+  accuracy(test_SOI)%>%
+  arrange(MAPE)
+```
+
+```{r}
+test_scores <- rbind(test_scores, test_scores2)
+
+test_score %>% 
+  filter(.model=="arima")%>%
+  summarise(sum = sum(MAPE), mean=mean(MAPE))
+#12.02825	4.009415	
+test_score %>% 
+  filter(.model=="ets")%>%
+  summarise(sum = sum(MAPE), mean = mean(MAPE))
+#10.3067	3.435566	
+
+# The best performing type of forecasting model across the different series is, according to the mean MAPE and RMSE score, the ETS
+#of the ETS and ARIMA model acoording to the mean MAPE and RMSE scores across the different time series, the model performing best is the ETS model 
+
+test_score %>% 
+  filter(.model=="arima")%>%
+  summarise(sum = sum(RMSE), mean=mean(RMSE))
+#0.1800321	0.0600107	
+test_score %>% 
+  filter(.model=="ets")%>%
+  summarise(sum = sum(RMSE), mean=mean(RMSE))
+#0.1505088	0.0501696	
+```
+# CASES - checking residuals for seperate state and model forecasts 
+```{r}
+STATES_OI %>%
+  filter(state=="ND")%>%
+  model(ETS(cases)) %>%
+  gg_tsresiduals()+
+    labs(title="ND - cases - ETS")
+STATES_OI %>%
+  filter(state=="ND")%>%
+  model(ARIMA(cases)) %>%
+  gg_tsresiduals()+
+  labs(title="ND - cases - ARIMA")
+
+STATES_OI %>%
+  filter(state=="NY")%>%
+  model(ETS(cases)) %>%
+  gg_tsresiduals()+
+    labs(title="NY - cases - ETS")
+STATES_OI %>%
+  filter(state=="NY")%>%
+  model(ARIMA(cases)) %>%
+  gg_tsresiduals()+
+  labs(title="NY - cases - ARIMA")
+
+STATES_OI %>%
+  filter(state=="VT")%>%
+  model(ETS(cases)) %>%
+  gg_tsresiduals()+
+    labs(title="VT - cases - ETS")
+STATES_OI %>%
+  filter(state=="VT")%>%
+  model(ARIMA(cases)) %>%
+  gg_tsresiduals()+
+  labs(title="VT - cases - ARIMA")
+```
+# DEATHS - checking residuals for seperate state and model forecasts 
+```{r}
+STATES_OI %>%
+  filter(state=="ND")%>%
+  model(ETS(deaths)) %>%
+  gg_tsresiduals()+
+    labs(title="ND - deaths - ETS")
+STATES_OI %>%
+  filter(state=="ND")%>%
+  model(ARIMA(deaths)) %>%
+  gg_tsresiduals()+
+  labs(title="ND - deaths - ARIMA")
+
+STATES_OI %>%
+  filter(state=="NY")%>%
+  model(ETS(deaths)) %>%
+  gg_tsresiduals()+
+    labs(title="NY - deaths - ETS")
+STATES_OI %>%
+  filter(state=="NY")%>%
+  model(ARIMA(deaths)) %>%
+  gg_tsresiduals()+
+  labs(title="NY - deaths - ARIMA")
+
+STATES_OI %>%
+  filter(state=="VT")%>%
+  model(ETS(deaths)) %>%
+  gg_tsresiduals()+
+    labs(title="VT - deaths - ETS")
+STATES_OI %>%
+  filter(state=="VT")%>%
+  model(ARIMA(deaths)) %>%
+  gg_tsresiduals()+
+  labs(title="VT - deaths - ARIMA")
+```
+
